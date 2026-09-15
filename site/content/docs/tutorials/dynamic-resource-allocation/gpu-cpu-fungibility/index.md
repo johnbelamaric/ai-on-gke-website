@@ -247,7 +247,7 @@ kubectl apply -f ./dra-drivers/dra-driver-image-configurator/deploy/deviceclass.
 ### Build and Push Specialized vLLM Workload Images
 
 While you can run public upstream images directly, building specialized container images for GPU and CPU inference and pushing them to your regional Google Artifact Registry repository provides two important advantages:
-1. **Clean Separation of Concerns**: Each image encapsulates its own architecture-specific flags and environment settings (`OMP_NUM_THREADS=12`, `VLLM_CPU_KVCACHE_SPACE=4`, `--max-model-len=8192`, `--enforce-eager` on CPU vs. standard serving on GPU). This keeps the Kubernetes `Deployment` manifest clean, portable, and declarative without needing inline shell wrapper scripts.
+1. **Clean Separation of Concerns**: Each image encapsulates its own architecture-specific flags and environment settings (dynamically determining `OMP_NUM_THREADS=$(nproc)`, `VLLM_CPU_KVCACHE_SPACE=4`, `--max-model-len=8192`, `--enforce-eager` on CPU vs. standard serving on GPU). This keeps the Kubernetes `Deployment` manifest clean, portable, and declarative without needing inline shell wrapper scripts.
 2. **Much Faster Image Pulls**: Pulling base images (~30 GB) directly from Docker Hub during pod startup can take several minutes and is subject to network latency or rate limits. Pulling from your regional Google Artifact Registry (`${LOCATION}-docker.pkg.dev`) allows GKE nodes to stream and cache layers within Google Cloud's high-speed internal network in seconds.
 
 Create the Dockerfiles for GPU and CPU:
@@ -258,15 +258,14 @@ mkdir -p images/vllm-gpu images/vllm-cpu
 # GPU Dockerfile: Standard vLLM serving for NVIDIA GPUs
 cat << 'EOF' > images/vllm-gpu/Dockerfile
 FROM vllm/vllm-openai:latest
-ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server", "--host=0.0.0.0", "--port=8000", "--model=google/gemma-4-E2B-it"]
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server", "--host=0.0.0.0", "--port=8000", "--model=google/gemma-4-E2B-it", "--max-model-len=8192", "--gpu-memory-utilization=0.85"]
 EOF
 
 # CPU Dockerfile: Optimized serving for exclusive CPUs via DRA
 cat << 'EOF' > images/vllm-cpu/Dockerfile
 FROM vllm/vllm-openai-cpu:latest
-ENV OMP_NUM_THREADS=12
 ENV VLLM_CPU_KVCACHE_SPACE=4
-ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server", "--host=0.0.0.0", "--port=8000", "--model=google/gemma-4-E2B-it", "--max-model-len=8192", "--enforce-eager"]
+ENTRYPOINT ["/bin/sh", "-c", "export OMP_NUM_THREADS=$(nproc) && exec python3 -m vllm.entrypoints.openai.api_server --host=0.0.0.0 --port=8000 --model=google/gemma-4-E2B-it --max-model-len=8192 --enforce-eager"]
 EOF
 ```
 
@@ -405,7 +404,7 @@ Key configuration elements:
   - Tolerates `DeletionCandidateOfClusterAutoscaler: PreferNoSchedule`: In autoscaled clusters, Cluster Autoscaler taints idle nodes with `DeletionCandidateOfClusterAutoscaler`. Without this toleration, kube-scheduler's `TaintToleration` score plugin penalizes idle GPU nodes, which could cause `firstAvailable` to fall back to CPU even when GPU capacity is available.
 - `resourceClaims`: References our `gpu-or-cpu` `ResourceClaimTemplate`. For every Pod replica created by the Deployment, Kubernetes creates an associated `ResourceClaim`.
 - `containers[0].image`: Uses a placeholder image (`registry.k8s.io/pause:3.10`). The `dra-driver-image-configurator` controller inspects the scheduler's device allocation, mutates the Pod image to the corresponding specialized image (`${REPO_URI}/vllm-gemma4-gpu:latest` or `${REPO_URI}/vllm-gemma4-cpu:latest`), emits an `ImagePatched` event, and satisfies the binding condition before Kubelet starts the container.
-- **Clean Container Definition**: Because each specialized image already encapsulates its own optimized entrypoint, threading (`OMP_NUM_THREADS=12`), KV cache configuration, and flags (`--enforce-eager`), the container spec requires no custom `command` or wrapper scripts.
+- **Clean Container Definition**: Because each specialized image already encapsulates its own optimized entrypoint, threading (`OMP_NUM_THREADS=$(nproc)`), KV cache configuration, and flags (`--enforce-eager`), the container spec requires no custom `command` or wrapper scripts.
 
 Inspect the following `deployment.yaml`:
 
@@ -442,6 +441,7 @@ spec:
       containers:
       - name: vllm
         image: registry.k8s.io/pause:3.10 # Will be mutated by the controller
+        imagePullPolicy: Always
         env:
         - name: HF_TOKEN
           valueFrom:
@@ -486,9 +486,9 @@ spec:
 >         args:
 >         - |
 >           if [ -e /dev/nvidia0 ]; then
->             exec python3 -m vllm.entrypoints.openai.api_server --host=0.0.0.0 --port=8000 --model=google/gemma-4-E2B-it
+>             exec python3 -m vllm.entrypoints.openai.api_server --host=0.0.0.0 --port=8000 --model=google/gemma-4-E2B-it --max-model-len=8192 --gpu-memory-utilization=0.85
 >           else
->             export OMP_NUM_THREADS=12
+>             export OMP_NUM_THREADS=$(nproc)
 >             export VLLM_CPU_KVCACHE_SPACE=4
 >             exec python3 -m vllm.entrypoints.openai.api_server --host=0.0.0.0 --port=8000 --model=google/gemma-4-E2B-it --max-model-len=8192 --enforce-eager
 >           fi
