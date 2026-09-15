@@ -494,7 +494,6 @@ spec:
 >           fi
 > ```
 > Both approaches achieve full fungibility, but pre-building specialized images and pushing them to your regional Artifact Registry is faster and avoids Docker Hub rate limits.
-```
 
 Apply the deployment and service:
 
